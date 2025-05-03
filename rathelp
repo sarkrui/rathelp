@@ -1,0 +1,725 @@
+#!/bin/bash
+
+set -e
+
+VERSION="0.0.1"
+SCRIPT_NAME="rathelp"
+CONFIG_DIR="/etc/rathole"
+DEFAULT_START_PORT=6000
+DEFAULT_END_PORT=8000
+DEFAULT_PROTOCOL="udp"
+DEFAULT_SERVER_ADDR="0.0.0.0:2333"
+DEFAULT_CLIENT_REMOTE_ADDR="server-address:2333"
+DEFAULT_TOKEN="this-is-aooo-nl-2025"
+
+show_help() {
+    echo "Rathole Configuration Helper - ${VERSION}"
+    echo ""
+    echo "Usage: ${SCRIPT_NAME} COMMAND [OPTIONS]"
+    echo ""
+    echo "Commands:"
+    echo "  install server    Install and configure rathole server"
+    echo "  install client    Install and configure rathole client"
+    echo "  generate server   Generate server configuration only"
+    echo "  generate client   Generate client configuration only"
+    echo "  uninstall         Remove rathole configuration and services"
+    echo ""
+    echo "Options:"
+    echo "  --start PORT      Start of port range (default: ${DEFAULT_START_PORT})"
+    echo "  --end PORT        End of port range (default: ${DEFAULT_END_PORT})"
+    echo "  --tcp             Use TCP protocol (default: ${DEFAULT_PROTOCOL})"
+    echo "  --udp             Use UDP protocol (default: ${DEFAULT_PROTOCOL})"
+    echo "  --server ADDR     Server address (default for server: ${DEFAULT_SERVER_ADDR})"
+    echo "  --remote ADDR     Remote server address (default for client: ${DEFAULT_CLIENT_REMOTE_ADDR})"
+    echo "  --token TOKEN     Authentication token (default: auto-generated)"
+    echo "  --no-tls          Disable TLS encryption"
+    echo "  --no-noise        Disable Noise protocol encryption"
+    echo "  --no-obfs         Disable all obfuscation (not recommended)"
+    echo "  --help            Show this help message"
+    echo ""
+    echo "Example:"
+    echo "  ${SCRIPT_NAME} install client --start 5000 --end 9000 --remote example.com:2333"
+    echo "  ${SCRIPT_NAME} install server --start 5000 --end 9000 --token my-secure-token"
+    echo ""
+}
+
+check_dependencies() {
+    local missing_deps=()
+    
+    if ! command -v openssl &> /dev/null; then
+        missing_deps+=("openssl")
+    fi
+    
+    if ! command -v curl &> /dev/null; then
+        missing_deps+=("curl")
+    fi
+    
+    if ! command -v jq &> /dev/null; then
+        missing_deps+=("jq")
+    fi
+
+    if [ ${#missing_deps[@]} -ne 0 ]; then
+        echo "Error: Missing dependencies: ${missing_deps[*]}"
+        echo "Please install them and try again."
+        exit 1
+    fi
+}
+
+generate_key() {
+    openssl rand -base64 32
+}
+
+create_tls_certificates() {
+    local cert_dir="$1"
+    mkdir -p "$cert_dir"
+    
+    # Generate CA key and certificate
+    openssl req -x509 -sha256 -days 365 -nodes -newkey rsa:2048 \
+        -subj "/CN=RatholeCA/C=US/L=SanFrancisco" \
+        -keyout "$cert_dir/rootCA.key" -out "$cert_dir/rootCA.crt"
+    
+    # Generate server key
+    openssl genrsa -out "$cert_dir/server.key" 2048
+    
+    # Create CSR config
+    cat > "$cert_dir/csr.conf" <<EOF
+[ req ]
+default_bits = 2048
+prompt = no
+default_md = sha256
+req_extensions = req_ext
+distinguished_name = dn
+
+[ dn ]
+C = US
+ST = California
+L = San Francisco
+O = Rathole
+OU = Proxy
+CN = localhost
+
+[ req_ext ]
+subjectAltName = @alt_names
+
+[ alt_names ]
+DNS.1 = localhost
+EOF
+    
+    # Create CSR
+    openssl req -new -key "$cert_dir/server.key" -out "$cert_dir/server.csr" -config "$cert_dir/csr.conf"
+    
+    # Create certificate config
+    cat > "$cert_dir/cert.conf" <<EOF
+authorityKeyIdentifier=keyid,issuer
+basicConstraints=CA:FALSE
+keyUsage = digitalSignature, nonRepudiation, keyEncipherment, dataEncipherment
+subjectAltName = @alt_names
+
+[alt_names]
+DNS.1 = localhost
+EOF
+    
+    # Create server certificate
+    openssl x509 -req \
+        -in "$cert_dir/server.csr" \
+        -CA "$cert_dir/rootCA.crt" -CAkey "$cert_dir/rootCA.key" \
+        -out "$cert_dir/server.crt" \
+        -days 365 \
+        -sha256 -extfile "$cert_dir/cert.conf"
+    
+    # Create PKCS12 file
+    openssl pkcs12 -export -out "$cert_dir/identity.pfx" \
+        -inkey "$cert_dir/server.key" -in "$cert_dir/server.crt" \
+        -certfile "$cert_dir/rootCA.crt" \
+        -passout pass:rathole \
+        -keypbe PBE-SHA1-3DES -certpbe PBE-SHA1-3DES
+    
+    # Clean up
+    rm "$cert_dir/server.csr" "$cert_dir/csr.conf" "$cert_dir/cert.conf"
+    
+    echo "TLS certificates created in $cert_dir"
+}
+
+generate_server_config() {
+    local start_port=$1
+    local end_port=$2
+    local protocol=$3
+    local server_addr=$4
+    local token=$5
+    local use_tls=$6
+    local use_noise=$7
+    local config_file=$8
+    
+    mkdir -p "$(dirname "$config_file")"
+    
+    # Create basic config
+    cat > "$config_file" <<EOF
+[server]
+bind_addr = "${server_addr}"
+default_token = "${token}"
+
+EOF
+    
+    # Add transport section if needed
+    if [ "$use_tls" = true ] && [ "$use_noise" = true ]; then
+        echo "Error: Cannot use both TLS and Noise at the same time"
+        exit 1
+    elif [ "$use_tls" = true ]; then
+        local cert_dir="${CONFIG_DIR}/tls"
+        if [ ! -f "${cert_dir}/identity.pfx" ]; then
+            create_tls_certificates "$cert_dir"
+        fi
+        
+        cat >> "$config_file" <<EOF
+[server.transport]
+type = "tls"
+[server.transport.tls]
+pkcs12 = "${cert_dir}/identity.pfx"
+pkcs12_password = "rathole"
+
+EOF
+    elif [ "$use_noise" = true ]; then
+        local private_key
+        private_key=$(generate_key)
+        
+        cat >> "$config_file" <<EOF
+[server.transport]
+type = "noise"
+[server.transport.noise]
+local_private_key = "${private_key}"
+
+EOF
+        # Save the private key for the client
+        echo "$private_key" > "${CONFIG_DIR}/server_private_key.txt"
+    fi
+    
+    # Add service entries for each port
+    for ((port=start_port; port<=end_port; port++)); do
+        cat >> "$config_file" <<EOF
+[server.services.port_${port}]
+type = "${protocol}"
+bind_addr = "0.0.0.0:${port}"
+
+EOF
+    done
+    
+    echo "Server configuration generated at $config_file"
+}
+
+generate_client_config() {
+    local start_port=$1
+    local end_port=$2
+    local protocol=$3
+    local remote_addr=$4
+    local token=$5
+    local use_tls=$6
+    local use_noise=$7
+    local config_file=$8
+    
+    mkdir -p "$(dirname "$config_file")"
+    sudo chown -R "$(id -u):$(id -g)" "$(dirname "$config_file")"
+    
+    # Create basic config
+    cat > "$config_file" <<EOF
+
+    
+[client]
+remote_addr = "${remote_addr}"
+default_token = "${token}"
+
+EOF
+    
+    # Add transport section if needed
+    if [ "$use_tls" = true ] && [ "$use_noise" = true ]; then
+        echo "Error: Cannot use both TLS and Noise at the same time"
+        exit 1
+    elif [ "$use_tls" = true ]; then
+        local cert_dir="${CONFIG_DIR}/tls"
+        # Client needs the CA certificate
+        if [ -f "${cert_dir}/rootCA.crt" ]; then
+            cat >> "$config_file" <<EOF
+[client.transport]
+type = "tls"
+[client.transport.tls]
+trusted_root = "${cert_dir}/rootCA.crt"
+hostname = "localhost"
+
+EOF
+        else
+            echo "Warning: TLS certificate not found. Please copy rootCA.crt from server."
+            cat >> "$config_file" <<EOF
+[client.transport]
+type = "tls"
+[client.transport.tls]
+trusted_root = "${cert_dir}/rootCA.crt"  # Copy this file from server
+hostname = "localhost"
+
+EOF
+        fi
+    elif [ "$use_noise" = true ]; then
+        local server_public_key=""
+        if [ -f "${CONFIG_DIR}/server_private_key.txt" ]; then
+            # This is a simplification - in a real scenario, you would derive the public key 
+            # from the private key or have it provided by the server
+            server_public_key=$(cat "${CONFIG_DIR}/server_private_key.txt")
+            echo "Using server key from local file. In a real deployment, obtain this securely from the server."
+        else
+            server_public_key="REPLACE_WITH_SERVER_PUBLIC_KEY"
+            echo "Warning: Server public key not found. Replace REPLACE_WITH_SERVER_PUBLIC_KEY in config file."
+        fi
+        
+        local client_private_key
+        client_private_key=$(generate_key)
+        
+        cat >> "$config_file" <<EOF
+[client.transport]
+type = "noise"
+[client.transport.noise]
+remote_public_key = "${server_public_key}"
+local_private_key = "${client_private_key}"
+
+EOF
+    fi
+    
+    # Add service entries for each port
+    for ((port=start_port; port<=end_port; port++)); do
+        cat >> "$config_file" <<EOF
+[client.services.port_${port}]
+type = "${protocol}"
+local_addr = "127.0.0.1:${port}"
+
+EOF
+    done
+    
+    echo "Client configuration generated at $config_file"
+}
+
+detect_os_arch() {
+    local os="unknown"
+    local arch="unknown"
+    
+    # Detect OS
+    if [[ "$OSTYPE" == "linux-gnu"* ]]; then
+        os="linux"
+    elif [[ "$OSTYPE" == "darwin"* ]]; then
+        os="darwin"
+    fi
+    
+    # Detect architecture
+    local machine="$(uname -m)"
+    if [[ "$machine" == "x86_64" ]]; then
+        arch="x86_64"
+    elif [[ "$machine" == "aarch64" || "$machine" == "arm64" ]]; then
+        arch="aarch64"
+    fi
+    
+    echo "${os}-${arch}"
+}
+
+download_rathole() {
+    echo "Downloading the latest version of rathole..."
+    
+    local temp_dir
+    temp_dir=$(mktemp -d)
+    
+    # Get latest release info
+    local latest_release
+    latest_release=$(curl -s https://api.github.com/repos/rapiz1/rathole/releases/latest)
+    local version
+    version=$(echo "$latest_release" | jq -r '.tag_name')
+    
+    echo "Latest version: $version"
+    
+    # Detect OS and architecture
+    local os_arch
+    os_arch=$(detect_os_arch)
+    
+    if [[ "$os_arch" == "unknown-unknown" ]]; then
+        echo "Error: Unable to detect OS or architecture"
+        return 1
+    fi
+    
+    echo "Detected system: $os_arch"
+    
+    # Determine appropriate asset
+    local asset_name=""
+    local download_url=""
+    
+    case "$os_arch" in
+        "linux-x86_64")
+            asset_name="rathole-${version}-x86_64-unknown-linux-musl.tar.gz"
+            ;;
+        "linux-aarch64")
+            asset_name="rathole-${version}-aarch64-unknown-linux-musl.tar.gz"
+            ;;
+        "darwin-x86_64") 
+            asset_name="rathole-${version}-x86_64-apple-darwin.tar.gz"
+            ;;
+        "darwin-aarch64")
+            asset_name="rathole-${version}-aarch64-apple-darwin.tar.gz"
+            ;;
+        *)
+            echo "Error: Unsupported OS or architecture: $os_arch"
+            return 1
+            ;;
+    esac
+    
+    # Find the matching asset and get download URL
+    download_url=$(echo "$latest_release" | jq -r ".assets[] | select(.name == \"$asset_name\") | .browser_download_url")
+    
+    if [[ -z "$download_url" ]]; then
+        echo "Error: Could not find download URL for $asset_name"
+        return 1
+    fi
+    
+    echo "Downloading from: $download_url"
+    
+    # Download and extract
+    curl -L -o "$temp_dir/$asset_name" "$download_url"
+    tar -xzf "$temp_dir/$asset_name" -C "$temp_dir"
+    
+    # Install the binary
+    local binary_path=""
+    
+    if [[ "$OSTYPE" == "darwin"* ]]; then
+        if [[ "$(uname -m)" == "arm64" ]]; then
+            binary_path="/opt/homebrew/bin/rathole"  # Apple Silicon Mac
+        else
+            binary_path="/usr/local/bin/rathole"     # Intel Mac
+        fi
+    else
+        binary_path="/usr/local/bin/rathole"  # Linux
+    fi
+    
+    echo "Installing rathole to $binary_path"
+    sudo mkdir -p "$(dirname "$binary_path")"
+    sudo mv "$temp_dir/rathole" "$binary_path"
+    sudo chmod +x "$binary_path"
+    
+    # Clean up
+    rm -rf "$temp_dir"
+    
+    echo "Successfully installed rathole at $binary_path"
+    return 0
+}
+
+install_rathole() {
+    echo "Installing rathole..."
+    
+    # Try to download binary first
+    if download_rathole; then
+        echo "Installation complete"
+        return
+    fi
+    
+    echo "Failed to download binary, trying alternative methods..."
+    
+    # For macOS, use Homebrew as fallback
+    if command -v brew &> /dev/null; then
+        brew install rathole
+    else
+        echo "Unable to install rathole automatically."
+        echo "Please install manually:"
+        echo "  1. Visit https://github.com/rapiz1/rathole/releases"
+        echo "  2. Download the appropriate binary for your platform"
+        echo "  3. Place it in a directory in your PATH"
+        return 1
+    fi
+    
+    echo "Installation complete"
+}
+
+uninstall_rathole() {
+    echo "Uninstalling rathole..."
+    
+    # Stop and remove services
+    if [[ "$OSTYPE" == "darwin"* ]]; then
+        # Check for server service
+        if [ -f "/Library/LaunchDaemons/com.rathole.server.plist" ]; then
+            echo "Stopping and removing server service..."
+            sudo launchctl unload "/Library/LaunchDaemons/com.rathole.server.plist"
+            sudo rm "/Library/LaunchDaemons/com.rathole.server.plist"
+        fi
+        
+        # Check for client service
+        if [ -f "/Library/LaunchDaemons/com.rathole.client.plist" ]; then
+            echo "Stopping and removing client service..."
+            sudo launchctl unload "/Library/LaunchDaemons/com.rathole.client.plist"
+            sudo rm "/Library/LaunchDaemons/com.rathole.client.plist"
+        fi
+    else
+        echo "Service removal for this platform not implemented"
+    fi
+    
+    # Remove configuration directory
+    if [ -d "$CONFIG_DIR" ]; then
+        echo "Removing configuration directory at $CONFIG_DIR..."
+        sudo rm -rf "$CONFIG_DIR"
+    fi
+    
+    # Optionally remove binary
+    read -p "Remove rathole binary? [y/N] " remove_binary
+    if [[ "$remove_binary" =~ ^[Yy]$ ]]; then
+        if [[ "$OSTYPE" == "darwin"* ]]; then
+            if command -v brew &> /dev/null && brew list rathole &> /dev/null; then
+                brew uninstall rathole
+            elif [ -f "/usr/local/bin/rathole" ]; then
+                sudo rm "/usr/local/bin/rathole"
+            fi
+        else
+            if [ -f "/usr/local/bin/rathole" ]; then
+                sudo rm "/usr/local/bin/rathole"
+            fi
+        fi
+        
+        echo "Rathole binary removed"
+    fi
+    
+    echo "Uninstallation complete"
+}
+
+setup_service() {
+    local mode=$1
+    local config_file=$2
+    
+    echo "Setting up rathole $mode service..."
+    
+    # macOS: Create launchd service
+    if [[ "$OSTYPE" == "darwin"* ]]; then
+        local plist_file="/Library/LaunchDaemons/com.rathole.${mode}.plist"
+        local temp_plist_file="/tmp/com.rathole.${mode}.plist.tmp"
+        
+        # Determine rathole binary path
+        local rathole_path=""
+        if [ -f "/opt/homebrew/bin/rathole" ]; then
+            rathole_path="/opt/homebrew/bin/rathole"  # Apple Silicon Mac
+        elif [ -f "/usr/local/bin/rathole" ]; then
+            rathole_path="/usr/local/bin/rathole"     # Intel Mac
+        else
+            rathole_path=$(which rathole 2>/dev/null)
+            if [ -z "$rathole_path" ]; then
+                echo "Error: Could not find rathole binary. Please install it first."
+                exit 1
+            fi
+        fi
+        
+        echo "Using rathole binary at: $rathole_path"
+        
+        # Create plist file in a temporary location first
+        cat > "$temp_plist_file" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.rathole.${mode}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>${rathole_path}</string>
+        <string>${config_file}</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardErrorPath</key>
+    <string>/var/log/rathole-${mode}.log</string>
+    <key>StandardOutPath</key>
+    <string>/var/log/rathole-${mode}.log</string>
+</dict>
+</plist>
+EOF
+        
+        # Move the temporary file to the target location with sudo
+        sudo mv "$temp_plist_file" "$plist_file"
+        sudo chmod 644 "$plist_file"
+        
+        # Load the service
+        sudo launchctl load "$plist_file"
+        echo "Service installed and started (${plist_file})"
+    else
+        echo "Unsupported platform for service installation"
+    fi
+}
+
+main() {
+    check_dependencies
+    
+    if [ $# -eq 0 ] || [ "$1" = "--help" ]; then
+        show_help
+        exit 0
+    fi
+    
+    # Parse command
+    local command="$1"
+    shift
+    
+    # Set default options
+    local mode=""
+    local start_port=$DEFAULT_START_PORT
+    local end_port=$DEFAULT_END_PORT
+    local protocol=$DEFAULT_PROTOCOL
+    local server_addr=$DEFAULT_SERVER_ADDR
+    local remote_addr=$DEFAULT_CLIENT_REMOTE_ADDR
+    local token=$DEFAULT_TOKEN
+    local use_tls=true
+    local use_noise=false
+    local install_mode=false
+    
+    # Parse sub-command
+    case "$command" in
+        "install")
+            if [ $# -eq 0 ]; then
+                echo "Error: Missing mode (server or client)"
+                show_help
+                exit 1
+            fi
+            
+            mode="$1"
+            shift
+            
+            if [ "$mode" != "server" ] && [ "$mode" != "client" ]; then
+                echo "Error: Invalid mode '$mode'. Must be 'server' or 'client'"
+                show_help
+                exit 1
+            fi
+            
+            install_mode=true
+            ;;
+        "generate")
+            if [ $# -eq 0 ]; then
+                echo "Error: Missing mode (server or client)"
+                show_help
+                exit 1
+            fi
+            
+            mode="$1"
+            shift
+            
+            if [ "$mode" != "server" ] && [ "$mode" != "client" ]; then
+                echo "Error: Invalid mode '$mode'. Must be 'server' or 'client'"
+                show_help
+                exit 1
+            fi
+            ;;
+        "uninstall")
+            uninstall_rathole
+            exit 0
+            ;;
+        *)
+            echo "Error: Unknown command '$command'"
+            show_help
+            exit 1
+            ;;
+    esac
+    
+    # Parse options
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --start)
+                shift
+                start_port="$1"
+                ;;
+            --end)
+                shift
+                end_port="$1"
+                ;;
+            --tcp)
+                protocol="tcp"
+                ;;
+            --udp)
+                protocol="udp"
+                ;;
+            --server)
+                shift
+                server_addr="$1"
+                ;;
+            --remote)
+                shift
+                remote_addr="$1"
+                ;;
+            --token)
+                shift
+                token="$1"
+                ;;
+            --no-tls)
+                use_tls=false
+                ;;
+            --no-noise)
+                use_noise=false
+                ;;
+            --no-obfs)
+                use_tls=false
+                use_noise=false
+                ;;
+            --help)
+                show_help
+                exit 0
+                ;;
+            *)
+                echo "Error: Unknown option '$1'"
+                show_help
+                exit 1
+                ;;
+        esac
+        shift
+    done
+    
+    # Validate options
+    if ! [[ "$start_port" =~ ^[0-9]+$ ]] || ! [[ "$end_port" =~ ^[0-9]+$ ]]; then
+        echo "Error: Port numbers must be integers"
+        exit 1
+    fi
+    
+    if [ "$start_port" -gt "$end_port" ]; then
+        echo "Error: Start port must be less than or equal to end port"
+        exit 1
+    fi
+    
+    if [ $((end_port - start_port + 1)) -gt 10000 ]; then
+        echo "Warning: Large port range (${start_port}-${end_port}). This may generate a very large config file."
+        read -p "Continue? [y/N] " confirm
+        if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+            echo "Aborted"
+            exit 1
+        fi
+    fi
+    
+    # Generate random token if default is used
+    if [ "$token" = "$DEFAULT_TOKEN" ]; then
+        token=$(openssl rand -hex 16)
+        echo "Generated random token: $token"
+    fi
+    
+    # Create config directory
+    sudo mkdir -p "$CONFIG_DIR"
+    
+    # Generate configurations
+    local config_file="${CONFIG_DIR}/${mode}.toml"
+    
+    if [ "$mode" = "server" ]; then
+        generate_server_config "$start_port" "$end_port" "$protocol" "$server_addr" "$token" "$use_tls" "$use_noise" "$config_file"
+    elif [ "$mode" = "client" ]; then
+        generate_client_config "$start_port" "$end_port" "$protocol" "$remote_addr" "$token" "$use_tls" "$use_noise" "$config_file"
+    fi
+    
+    # Install and configure service if needed
+    if [ "$install_mode" = true ]; then
+        install_rathole
+        setup_service "$mode" "$config_file"
+    fi
+    
+    echo "Configuration complete!"
+    if [ "$mode" = "server" ]; then
+        echo "Next steps:"
+        echo "  1. Ensure your firewall allows connections on ports ${server_addr%:*}:${start_port}-${end_port}"
+        echo "  2. If using TLS, distribute ${CONFIG_DIR}/tls/rootCA.crt to clients"
+        echo "  3. Start rathole: rathole ${config_file}"
+    else
+        echo "Next steps:"
+        echo "  1. If using TLS, ensure you have the server's rootCA.crt file"
+        echo "  2. Start rathole: rathole ${config_file}"
+    fi
+}
+
+main "$@" 
