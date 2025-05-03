@@ -247,6 +247,8 @@ hostname = "localhost"
 EOF
         else
             echo "Warning: TLS certificate not found. Please copy rootCA.crt from server."
+            echo "Store the rootCA.crt file at: ${cert_dir}/rootCA.crt"
+            echo "Run: mkdir -p ${cert_dir} && cp /path/to/downloaded/rootCA.crt ${cert_dir}/rootCA.crt"
             cat >> "$config_file" <<EOF
 [client.transport]
 type = "tls"
@@ -317,7 +319,37 @@ detect_os_arch() {
 }
 
 download_rathole() {
-    echo "Downloading the latest version of rathole..."
+    echo "Installing rathole..."
+    
+    # For macOS, always use Homebrew
+    if [[ "$OSTYPE" == "darwin"* ]]; then
+        if ! command -v brew &> /dev/null; then
+            echo "Error: Homebrew is not installed. Please install Homebrew first:"
+            echo "  /bin/bash -c \"$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)\""
+            return 1
+        fi
+        
+        # Check if rathole is already installed via Homebrew
+        if brew list rathole &> /dev/null; then
+            echo "rathole is already installed via Homebrew. Updating..."
+            brew upgrade rathole || true
+        else
+            echo "Installing rathole via Homebrew..."
+            brew install rathole
+        fi
+        
+        # Verify installation
+        if ! command -v rathole &> /dev/null; then
+            echo "Error: Failed to install rathole using Homebrew"
+            return 1
+        fi
+        
+        echo "Successfully installed rathole via Homebrew"
+        return 0
+    fi
+    
+    # For Linux and other platforms, download from GitHub
+    echo "Downloading the latest version of rathole from GitHub..."
     
     local temp_dir
     temp_dir=$(mktemp -d)
@@ -351,12 +383,6 @@ download_rathole() {
         "linux-aarch64")
             asset_name="rathole-aarch64-unknown-linux-musl.zip"
             ;;
-        "darwin-x86_64") 
-            asset_name="rathole-x86_64-apple-darwin.zip"
-            ;;
-        "darwin-aarch64")
-            asset_name="rathole-aarch64-apple-darwin.zip"
-            ;;
         *)
             echo "Error: Unsupported OS or architecture: $os_arch"
             return 1
@@ -380,17 +406,7 @@ download_rathole() {
     unzip -q "$temp_dir/$asset_name" -d "$temp_dir"
     
     # Install the binary
-    local binary_path=""
-    
-    if [[ "$OSTYPE" == "darwin"* ]]; then
-        if [[ "$(uname -m)" == "arm64" ]]; then
-            binary_path="/opt/homebrew/bin/rathole"  # Apple Silicon Mac
-        else
-            binary_path="/usr/local/bin/rathole"     # Intel Mac
-        fi
-    else
-        binary_path="/usr/local/bin/rathole"  # Linux
-    fi
+    local binary_path="/usr/local/bin/rathole"  # Linux
     
     echo "Installing rathole to $binary_path"
     sudo mkdir -p "$(dirname "$binary_path")"
@@ -435,18 +451,50 @@ uninstall_rathole() {
     
     # Stop and remove services
     if [[ "$OSTYPE" == "darwin"* ]]; then
-        # Check for server service
-        if [ -f "/Library/LaunchDaemons/com.rathole.server.plist" ]; then
-            echo "Stopping and removing server service..."
-            sudo launchctl unload "/Library/LaunchDaemons/com.rathole.server.plist"
-            sudo rm "/Library/LaunchDaemons/com.rathole.server.plist"
+        # Check for Homebrew service
+        if command -v brew &> /dev/null && brew list rathole &> /dev/null; then
+            echo "Stopping Homebrew services..."
+            sudo brew services stop rathole 2>/dev/null || true
+            brew services stop rathole 2>/dev/null || true
         fi
         
-        # Check for client service
+        # Check for system-wide services
+        if [ -f "/Library/LaunchDaemons/homebrew.mxcl.rathole.plist" ]; then
+            echo "Stopping and removing system-wide service..."
+            sudo launchctl unload -w "/Library/LaunchDaemons/homebrew.mxcl.rathole.plist" 2>/dev/null || true
+            sudo rm -f "/Library/LaunchDaemons/homebrew.mxcl.rathole.plist"
+        fi
+        
+        # Check for user-level services
+        if [ -f "$HOME/Library/LaunchAgents/homebrew.mxcl.rathole.plist" ]; then
+            echo "Stopping and removing user-level service..."
+            launchctl unload -w "$HOME/Library/LaunchAgents/homebrew.mxcl.rathole.plist" 2>/dev/null || true
+            rm -f "$HOME/Library/LaunchAgents/homebrew.mxcl.rathole.plist"
+        fi
+        
+        # Check for legacy service files and remove them if they exist
+        if [ -f "/Library/LaunchDaemons/com.rathole.server.plist" ]; then
+            echo "Removing legacy system-wide server service..."
+            sudo launchctl unload -w "/Library/LaunchDaemons/com.rathole.server.plist" 2>/dev/null || true
+            sudo rm -f "/Library/LaunchDaemons/com.rathole.server.plist"
+        fi
+        
         if [ -f "/Library/LaunchDaemons/com.rathole.client.plist" ]; then
-            echo "Stopping and removing client service..."
-            sudo launchctl unload "/Library/LaunchDaemons/com.rathole.client.plist"
-            sudo rm "/Library/LaunchDaemons/com.rathole.client.plist"
+            echo "Removing legacy system-wide client service..."
+            sudo launchctl unload -w "/Library/LaunchDaemons/com.rathole.client.plist" 2>/dev/null || true
+            sudo rm -f "/Library/LaunchDaemons/com.rathole.client.plist"
+        fi
+        
+        if [ -f "$HOME/Library/LaunchAgents/com.rathole.server.plist" ]; then
+            echo "Removing legacy user-level server service..."
+            launchctl unload -w "$HOME/Library/LaunchAgents/com.rathole.server.plist" 2>/dev/null || true
+            rm -f "$HOME/Library/LaunchAgents/com.rathole.server.plist"
+        fi
+        
+        if [ -f "$HOME/Library/LaunchAgents/com.rathole.client.plist" ]; then
+            echo "Removing legacy user-level client service..."
+            launchctl unload -w "$HOME/Library/LaunchAgents/com.rathole.client.plist" 2>/dev/null || true
+            rm -f "$HOME/Library/LaunchAgents/com.rathole.client.plist"
         fi
     else
         echo "Service removal for this platform not implemented"
@@ -458,18 +506,28 @@ uninstall_rathole() {
         sudo rm -rf "$CONFIG_DIR"
     fi
     
+    # Remove Homebrew configuration if it exists
+    if command -v brew &> /dev/null; then
+        local brew_config_dir="$(brew --prefix 2>/dev/null)/etc/rathole"
+        if [ -d "$brew_config_dir" ]; then
+            echo "Removing Homebrew configuration at $brew_config_dir..."
+            rm -rf "$brew_config_dir"
+        fi
+    fi
+    
     # Optionally remove binary
-    read -p "Remove rathole binary? [y/N] " remove_binary
+    read -p "Uninstall rathole binary? [y/N] " remove_binary
     if [[ "$remove_binary" =~ ^[Yy]$ ]]; then
         if [[ "$OSTYPE" == "darwin"* ]]; then
             if command -v brew &> /dev/null && brew list rathole &> /dev/null; then
+                echo "Uninstalling rathole via Homebrew..."
                 brew uninstall rathole
             elif [ -f "/usr/local/bin/rathole" ]; then
-                sudo rm "/usr/local/bin/rathole"
+                sudo rm -f "/usr/local/bin/rathole"
             fi
         else
             if [ -f "/usr/local/bin/rathole" ]; then
-                sudo rm "/usr/local/bin/rathole"
+                sudo rm -f "/usr/local/bin/rathole"
             fi
         fi
         
@@ -485,60 +543,142 @@ setup_service() {
     
     echo "Setting up rathole $mode service..."
     
-    # macOS: Create launchd service
+    # macOS: Use Homebrew services
     if [[ "$OSTYPE" == "darwin"* ]]; then
-        local plist_file="/Library/LaunchDaemons/com.rathole.${mode}.plist"
-        local temp_plist_file="/tmp/com.rathole.${mode}.plist.tmp"
-        
-        # Determine rathole binary path
-        local rathole_path=""
-        if [ -f "/opt/homebrew/bin/rathole" ]; then
-            rathole_path="/opt/homebrew/bin/rathole"  # Apple Silicon Mac
-        elif [ -f "/usr/local/bin/rathole" ]; then
-            rathole_path="/usr/local/bin/rathole"     # Intel Mac
-        else
-            rathole_path=$(which rathole 2>/dev/null)
-            if [ -z "$rathole_path" ]; then
-                echo "Error: Could not find rathole binary. Please install it first."
-                exit 1
-            fi
+        if ! command -v brew &> /dev/null; then
+            echo "Error: Homebrew is not installed. Please install Homebrew first"
+            exit 1
         fi
         
-        echo "Using rathole binary at: $rathole_path"
+        if ! brew list rathole &> /dev/null; then
+            echo "Error: rathole is not installed via Homebrew. Please run installation first"
+            exit 1
+        fi
         
-        # Create plist file in a temporary location first
-        cat > "$temp_plist_file" <<EOF
+        # Determine Homebrew prefix and config directory
+        local brew_prefix=$(brew --prefix)
+        local rathole_config_dir="${brew_prefix}/etc/rathole"
+        
+        # Create config directory if it doesn't exist
+        mkdir -p "$rathole_config_dir"
+        
+        # Copy our config file to the Homebrew expected location
+        echo "Copying configuration to Homebrew location..."
+        if [ "$mode" = "server" ]; then
+            # For server, we name it rathole.toml (primary config)
+            cp "$config_file" "${rathole_config_dir}/rathole.toml"
+            echo "Server configuration copied to ${rathole_config_dir}/rathole.toml"
+        else
+            # For client, we keep it as client.toml (but we'll need to modify the service command)
+            cp "$config_file" "${rathole_config_dir}/client.toml"
+            echo "Client configuration copied to ${rathole_config_dir}/client.toml"
+        fi
+        
+        # Ask if user wants system-wide or user-level service
+        echo "Do you want to install rathole as a system-wide service or user-level service?"
+        echo "  1) System-wide (starts at boot, requires admin password)"
+        echo "  2) User-level (starts at login)"
+        read -p "Enter option [1/2]: " service_level
+        
+        # Create environment variables file that tells rathole which config to use
+        if [ "$mode" = "client" ]; then
+            # For client mode, we need to create a custom command that points to the client config
+            local command_args="${rathole_config_dir}/client.toml"
+            
+            # Create a custom plist that overrides the default command
+            if [[ "$service_level" == "1" ]]; then
+                # System-wide
+                sudo mkdir -p /Library/LaunchDaemons
+                cat > /tmp/homebrew.mxcl.rathole.plist <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.rathole.${mode}</string>
+    <string>homebrew.mxcl.rathole</string>
     <key>ProgramArguments</key>
     <array>
-        <string>${rathole_path}</string>
-        <string>${config_file}</string>
+        <string>${brew_prefix}/opt/rathole/bin/rathole</string>
+        <string>${command_args}</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
     <true/>
     <key>StandardErrorPath</key>
-    <string>/var/log/rathole-${mode}.log</string>
+    <string>/tmp/rathole-${mode}.err.log</string>
     <key>StandardOutPath</key>
-    <string>/var/log/rathole-${mode}.log</string>
+    <string>/tmp/rathole-${mode}.out.log</string>
 </dict>
 </plist>
 EOF
-        
-        # Move the temporary file to the target location with sudo
-        sudo mv "$temp_plist_file" "$plist_file"
-        sudo chmod 644 "$plist_file"
-        
-        # Load the service
-        sudo launchctl load "$plist_file"
-        echo "Service installed and started (${plist_file})"
+                sudo mv /tmp/homebrew.mxcl.rathole.plist /Library/LaunchDaemons/
+                sudo chown root:wheel /Library/LaunchDaemons/homebrew.mxcl.rathole.plist
+                sudo chmod 644 /Library/LaunchDaemons/homebrew.mxcl.rathole.plist
+                
+                echo "Starting system-wide service for client mode..."
+                sudo launchctl load -w /Library/LaunchDaemons/homebrew.mxcl.rathole.plist
+                
+                echo "Service installed and started as system-wide service"
+                echo "To manage the service:"
+                echo "  Start: sudo launchctl load -w /Library/LaunchDaemons/homebrew.mxcl.rathole.plist"
+                echo "  Stop:  sudo launchctl unload -w /Library/LaunchDaemons/homebrew.mxcl.rathole.plist"
+            else
+                # User-level
+                mkdir -p ~/Library/LaunchAgents
+                cat > ~/Library/LaunchAgents/homebrew.mxcl.rathole.plist <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>homebrew.mxcl.rathole</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>${brew_prefix}/opt/rathole/bin/rathole</string>
+        <string>${command_args}</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardErrorPath</key>
+    <string>/tmp/rathole-${mode}.err.log</string>
+    <key>StandardOutPath</key>
+    <string>/tmp/rathole-${mode}.out.log</string>
+</dict>
+</plist>
+EOF
+                chmod 644 ~/Library/LaunchAgents/homebrew.mxcl.rathole.plist
+                
+                echo "Starting user-level service for client mode..."
+                launchctl load -w ~/Library/LaunchAgents/homebrew.mxcl.rathole.plist
+                
+                echo "Service installed and started as user-level service"
+                echo "To manage the service:"
+                echo "  Start: launchctl load -w ~/Library/LaunchAgents/homebrew.mxcl.rathole.plist"
+                echo "  Stop:  launchctl unload -w ~/Library/LaunchAgents/homebrew.mxcl.rathole.plist"
+            fi
+        else
+            # For server mode (default config), we can use brew services directly
+            if [[ "$service_level" == "1" ]]; then
+                # System-wide service (as root)
+                echo "Starting system-wide service..."
+                sudo brew services start rathole
+                
+                echo "Service installed and started as system-wide service"
+                echo "To manage the service, use: sudo brew services [start|stop|restart] rathole"
+            else
+                # User-level service
+                echo "Starting user-level service..."
+                brew services start rathole
+                
+                echo "Service installed and started as user-level service"
+                echo "To manage the service, use: brew services [start|stop|restart] rathole"
+            fi
+        fi
     else
+        # Linux: Setup systemd service
         echo "Unsupported platform for service installation"
     fi
 }
